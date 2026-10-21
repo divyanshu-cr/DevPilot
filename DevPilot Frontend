@@ -1,0 +1,3 @@
+Project Setup and Code Highlighter Installation:
+cat package.json | head -60; ls src/components/ui 2>/dev/null | tr '\n' ' '; cat AGENTS.md | head -30
+bun add react-syntax-highlighter && bun add -d @types/react-syntax-highlighter; grep -n sonner package.json; head -30 src/components/ui/button.tsx; grep -n "variant\|default:" src/components/ui/button.tsx | head; curl -s https://ai.gateway.lovable.dev/v1/models -H "Authorization: Bearer $LOVABLE_API_KEY" | grep -o '"id":"google/gemini-2.5-flash[^"]*"'
