@@ -1,0 +1,43 @@
+Debug.ts:
+export type Language = "python" | "javascript" | "curl";
+
+export type ErrorType =
+  | "401" | "403" | "404" | "422" | "429" | "500"
+  | "CORS" | "CONTENT_TYPE" | "MALFORMED_BODY" | "TIMEOUT" | "OTHER";
+
+export interface DebugInput {
+  request: string;
+  error: string;
+  docs: string;
+  language: Language;
+}
+
+export interface TraceStep {
+  id: string;
+  label: string;
+  detail: string;
+}
+
+export interface DebugResult {
+  status_code: number | null;
+  error_type: ErrorType;
+  title: string;
+  steps: TraceStep[];
+  root_cause: string;
+  explanation: string;
+  fixed_code: string;
+  prevention_tips: string[];
+  confidence: number;
+}
+
+export type StepStatus = "pending" | "running" | "done";
+
+export const TRACE_LABELS = [
+  "Parsing request",
+  "Identifying API & auth method",
+  "Checking headers/body/status code",
+  "Finding root cause",
+  "Generating fix",
+] as const;
+
+export const MAX_FIELD_CHARS = 20000;
