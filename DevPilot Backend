@@ -142,3 +142,392 @@ export async function runDebug(
         break;
       }
     }
+Debug-API.ts:
+import { createFileRoute } from "@tanstack/react-router";
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+const MAX = 20000;
+const LANGS = { python: "Python (requests)", javascript: "JavaScript (fetch)", curl: "cURL" } as const;
+
+const SYSTEM = `You are DevPilot, a senior API integration engineer who debugs failing API calls.
+Rules:
+- Use ONLY the evidence given (request/code, error/logs, optional docs). Do not invent API features, endpoints, or headers not supported by the evidence or widely-standard HTTP behavior. If unsure, lower confidence.
+- fixed_code must be complete, runnable code in the requested language only, with no markdown fences inside the string.
+- explanation is beginner-friendly, 2-4 sentences, and includes a short everyday analogy.
+- Respond with ONLY a JSON object (no markdown) with keys in THIS order:
+{"steps":[5 objects {"id","label","detail"} with ids "parse","identify","check","root_cause","fix" and labels exactly "Parsing request","Identifying API & auth method","Checking headers/body/status code","Finding root cause","Generating fix"; detail = one concise finding sentence],
+"status_code": number|null,
+"error_type": one of "401","403","404","422","429","500","CORS","CONTENT_TYPE","MALFORMED_BODY","TIMEOUT","OTHER",
+"title": short diagnosis title,
+"root_cause": 1-3 sentences,
+"explanation": string,
+"fixed_code": string,
+"prevention_tips": 3-5 short strings,
+"confidence": integer 0-100}`;
+
+const json = (body: unknown, status: number) =>
+  new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
+
+export const Route = createFileRoute("/api/debug-api")({
+  server: {
+    handlers: {
+      OPTIONS: async () => new Response(null, { status: 204, headers: CORS }),
+      POST: async ({ request }) => {
+        let body: Record<string, unknown>;
+        try { body = await request.json(); } catch { return json({ error: "Invalid request body." }, 400); }
+        const req = typeof body.request === "string" ? body.request.trim() : "";
+        const err = typeof body.error === "string" ? body.error.trim() : "";
+        const docs = typeof body.docs === "string" ? body.docs.trim() : "";
+        const lang = (body.language as keyof typeof LANGS) in LANGS ? (body.language as keyof typeof LANGS) : "python";
+        if (!req || !err) return json({ error: "Request and error fields are required." }, 400);
+        if (req.length > MAX || err.length > MAX || docs.length > MAX)
+          return json({ error: `Each field must be under ${MAX.toLocaleString()} characters.` }, 413);
+
+        const key = process.env.LOVABLE_API_KEY;
+        if (!key) return json({ error: "AI is not configured." }, 500);
+
+        const user = `Fixed code language: ${LANGS[lang]}\n\n### Request / code\n${req}\n\n### Error / response / logs\n${err}\n\n### API docs snippet\n${docs || "(none provided)"}`;
+        const upstream = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", "X-Lovable-AIG-SDK": "fetch" },
+          body: JSON.stringify({
+            model: "google/gemini-2.5-flash",
+            stream: true,
+            messages: [{ role: "system", content: SYSTEM }, { role: "user", content: user }],
+          }),
+          signal: request.signal,
+        });
+        if (!upstream.ok || !upstream.body) {
+          const s = upstream.status;
+          const msg = s === 429 ? "DevPilot is getting a lot of requests right now. Please wait a moment and retry."
+            : s === 402 ? "AI credits are used up for this workspace. Add credits to keep debugging."
+            : s === 403 ? "AI access is blocked for this workspace."
+            : "The AI service had a problem. Please retry.";
+          return json({ error: msg }, s === 429 || s === 402 || s === 403 ? s : 502);
+        }
+        return new Response(upstream.body, {
+          headers: { ...CORS, "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform" },
+        });
+      },
+    },
+  },
+});
+Examples.ts:
+import type { DebugInput } from "@/types/debug";
+
+export interface Example extends DebugInput { id: string; name: string }
+
+export const EXAMPLES: Example[] = [
+  {
+    id: "401", name: "401 Missing Bearer", language: "python",
+    request: `import requests
+
+API_KEY = "sk_live_51Hx...redacted"
+resp = requests.get(
+    "https://api.stripe.com/v1/customers?limit=3",
+    headers={"Authorization": API_KEY},
+)
+print(resp.status_code, resp.json())`,
+    error: `401 Unauthorized
+{
+  "error": {
+    "message": "Invalid API Key provided: sk_live_****cted. Authorization header must use the Bearer scheme.",
+    "type": "invalid_request_error"
+  }
+}`,
+    docs: `Authentication: Authenticate by providing your secret key in the Authorization header using Bearer auth:
+  Authorization: Bearer sk_live_...`,
+  },
+  {
+    id: "429", name: "429 Rate limit", language: "javascript",
+    request: `const ids = Array.from({ length: 500 }, (_, i) => i + 1);
+await Promise.all(ids.map(id =>
+  fetch(\`https://api.github.com/repos/acme/app/issues/\${id}\`, {
+    headers: { Authorization: \`Bearer \${process.env.GH_TOKEN}\` }
+  }).then(r => r.json())
+));`,
+    error: `HTTP/1.1 429 Too Many Requests
+retry-after: 60
+x-ratelimit-limit: 5000
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1760841600
+{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}
+(312 of 500 requests failed)`,
+    docs: `If you exceed a secondary rate limit you will receive 403 or 429. If the retry-after header is present, do not retry until that many seconds have elapsed. Otherwise wait at least one minute, and use exponential backoff for repeated failures. Avoid making many concurrent requests.`,
+  },
+  {
+    id: "cors", name: "CORS from browser", language: "javascript",
+    request: `// React component, running at http://localhost:5173
+const res = await fetch("https://api.openweather.internal.acme.com/v2/forecast?city=Paris", {
+  headers: { "X-API-Key": import.meta.env.VITE_WEATHER_KEY }
+});
+const data = await res.json();`,
+    error: `Access to fetch at 'https://api.openweather.internal.acme.com/v2/forecast?city=Paris' from origin 'http://localhost:5173' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource.
+TypeError: Failed to fetch`,
+    docs: `The Forecast API is a server-to-server API. Requests must be made from your backend; browser origins are not allowlisted. Authenticate with the X-API-Key header. Never expose your key in client-side code.`,
+  },
+  {
+    id: "ctype", name: "Wrong Content-Type", language: "python",
+    request: `import requests, json
+
+payload = {"name": "Ada Lovelace", "email": "ada@example.com"}
+resp = requests.post(
+    "https://api.hubapi.example.com/crm/v3/contacts",
+    headers={"Authorization": "Bearer pat-na1-xxxx", "Content-Type": "application/x-www-form-urlencoded"},
+    data=json.dumps(payload),
+)
+print(resp.status_code, resp.text)`,
+    error: `415 Unsupported Media Type
+{"status":"error","message":"Content-Type 'application/x-www-form-urlencoded' is not supported. Expected 'application/json'.","category":"UNSUPPORTED_MEDIA_TYPE"}`,
+    docs: `POST /crm/v3/contacts
+Headers: Authorization: Bearer <token>, Content-Type: application/json
+Body: {"name": string, "email": string}`,
+  },
+  {
+    id: "json", name: "Malformed JSON", language: "curl",
+    request: `curl -X POST https://api.sendgrid.example.com/v3/mail/send \\
+  -H "Authorization: Bearer SG.xxxx" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "personalizations": [{"to": [{"email": "user@example.com"}]}],
+    "from": {"email": "noreply@acme.com"},
+    "subject": "Welcome!",
+    "content": [{"type": "text/plain", "value": "Hello"}],
+  }'`,
+    error: `HTTP/2 400
+{"errors":[{"message":"Bad Request: invalid JSON - Unexpected token } in JSON at position 214","field":null}]}`,
+    docs: `POST /v3/mail/send — Request body must be valid JSON (RFC 8259) with personalizations, from, subject and content fields.`,
+  },
+];
+Site header.tsx:
+import { Link } from "@tanstack/react-router";
+import { Bug } from "lucide-react";
+
+export function SiteHeader() {
+  const link = "rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors";
+  return (
+    <header className="sticky top-0 z-20 border-b bg-background/80 backdrop-blur">
+      <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4">
+        <Link to="/" className="flex items-center gap-2 font-semibold" aria-label="DevPilot home">
+          <span className="grid h-7 w-7 place-items-center rounded-md bg-gradient-brand"><Bug className="h-4 w-4 text-primary-foreground" /></span>
+          DevPilot
+        </Link>
+        <nav aria-label="Main" className="flex gap-1">
+          <Link to="/" className={link} activeOptions={{ exact: true }} activeProps={{ className: "text-foreground bg-secondary" }}>Home</Link>
+          <Link to="/debug" className={link} activeProps={{ className: "text-foreground bg-secondary" }}>Debugger</Link>
+        </nav>
+      </div>
+    </header>
+  );
+}
+CodeBlock.tsx:
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { Copy } from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import 
+ExamplesBar.tsx:
+import { Sparkles } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { EXAMPLES, type Example } from "@/data/examples";
+
+export function ExamplesBar({ onPick, disabled }: { onPick: (e: Example) => void; disabled?: boolean }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Quick examples">
+      <span className="flex items-center gap-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        <Sparkles className="h-3.5 w-3.5" /> Quick examples
+      </span>
+      {EXAMPLES.map((e) => (
+        <Button key={e.id} size="sm" variant="outline" disabled={disabled} onClick={() => onPick(e)}>{e.name}</Button>
+      ))}
+    </div>
+  );
+}
+Input panel.tsx:
+import { Loader2, Wand2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { MAX_FIELD_CHARS, type DebugInput, type Language } from "@/types/debug";
+
+interface Props { value: DebugInput; onChange: (v: DebugInput) => void; onSubmit: () => void; loading: boolean }
+
+export function InputPanel({ value, onChange, onSubmit, loading }: Props) {
+  const set = (k: keyof DebugInput) => (e: React.ChangeEvent<HTMLTextAreaElement>) =>
+    onChange({ ...value, [k]: e.target.value.slice(0, MAX_FIELD_CHARS) });
+  const ready = value.request.trim() && value.error.trim();
+  const field = (id: keyof DebugInput, label: string, ph: string, rows: number) => (
+    <div className="space-y-1.5">
+      <div className="flex justify-between">
+        <Label htmlFor={id}>{label}</Label>
+        <span className="text-xs text-muted-foreground">{(value[id] as string).length.toLocaleString()}/{MAX_FIELD_CHARS.toLocaleString()}</span>
+      </div>
+      <Textarea id={id} rows={rows} value={value[id] as string} onChange={set(id)} placeholder={ph} className="font-mono text-xs bg-code" spellCheck={false} />
+    </div>
+  );
+  return (
+    <section aria-label="Debug input" className="space-y-4 rounded-xl border bg-card p-4">
+      {field("request", "Request / code", "Paste the failing request or code…", 9)}
+      {field("error", "Error / response / logs", "Paste the error, response body or logs…", 7)}
+      {field("docs", "API docs snippet (optional)", "Paste relevant docs to ground the fix…", 4)}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+        <div className="space-y-1.5 sm:w-44">
+          <Label htmlFor="lang">Fixed code language</Label>
+          <Select value={value.language} onValueChange={(v) => onChange({ ...value, language: v as Language })}>
+            <SelectTrigger id="lang" aria-label="Fixed code language"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="python">Python</SelectItem>
+              <SelectItem value="javascript">JavaScript</SelectItem>
+              <SelectItem value="curl">cURL</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <Button variant="hero" size="lg" className="flex-1" disabled={!ready || loading} onClick={onSubmit}>
+          {loading ? <Loader2 className="animate-spin" /> : <Wand2 />} {loading ? "Investigating…" : "Debug with DevPilot"}
+        </Button>
+      </div>
+    </section>
+  );
+}
+AgentTrace.tsx:
+import { CheckCircle2, Circle, Loader2 } from "lucide-react";
+import { TRACE_LABELS, type StepStatus, type TraceStep } from "@/types/debug";
+import { cn } from "@/lib/utils";
+
+export function AgentTrace({ steps, running }: { steps: TraceStep[]; running: boolean }) {
+  return (
+    <section aria-label="Agent trace" aria-live="polite" className="rounded-xl border bg-card p-4">
+      <h2 className="mb-3 text-sm font-semibold">Agent Trace</h2>
+      <ol className="space-y-3">
+        {TRACE_LABELS.map((label, i) => {
+          const s = steps[i];
+          const status: StepStatus = s ? "done" : running && i === steps.length ? "running" : "pending";
+          return (
+            <li key={label} className={cn("flex gap-3 transition-opacity animate-in fade-in", status === "pending" && "opacity-50")}>
+              {status === "done" ? <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-success" aria-label="done" />
+                : status === "running" ? <Loader2 className="mt-0.5 h-5 w-5 shrink-0 animate-spin text-brand-to" aria-label="running" />
+                : <Circle className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" aria-label="pending" />}
+              <div>
+                <p className="text-sm font-medium">{label}</p>
+                {s?.detail && <p className="text-xs text-muted-foreground animate-in fade-in slide-in-from-left-1">{s.detail}</p>}
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+ResultCards.tsx:
+import { AlertTriangle, BookOpen, Code2, Lightbulb, RotateCcw, ShieldCheck, Telescope } from "lucide-react";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
+import { CodeBlock } from "./CodeBlock";
+import type { DebugResult, Language } from "@/types/debug";
+import { cn } from "@/lib/utils";
+
+function Card({ icon: Icon, title, children }: { icon: typeof Code2; title: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-xl border bg-card p-4 animate-in fade-in slide-in-from-bottom-2">
+      <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold"><Icon className="h-4 w-4 text-brand-to" />{title}</h3>
+      {children}
+    </div>
+  );
+}
+
+interface Props { result: DebugResult | null; loading: boolean; error: string | null; language: Language; onRetry: () => void }
+
+export function ResultCards({ result, loading, error, language, onRetry }: Props) {
+  if (error) return (
+    <div role="alert" className="rounded-xl border border-destructive/50 bg-card p-5 text-center">
+      <AlertTriangle className="mx-auto mb-2 h-6 w-6 text-destructive" />
+      <p className="text-sm">{error}</p>
+      <Button variant="outline" size="sm" className="mt-3" onClick={onRetry}><RotateCcw /> Retry</Button>
+    </div>
+  );
+  if (loading) return (
+    <div className="space-y-3" aria-busy="true" aria-label="Loading results">
+      {[0, 1, 2].map((i) => <div key={i} className="rounded-xl border bg-card p-4 space-y-2"><Skeleton className="h-4 w-32" /><Skeleton className="h-3 w-full" /><Skeleton className="h-3 w-4/5" /></div>)}
+    </div>
+  );
+  if (!result) return (
+    <div className="rounded-xl border border-dashed p-8 text-center text-muted-foreground">
+      <Telescope className="mx-auto mb-2 h-7 w-7" />
+      <p className="text-sm">Paste a failing request and error, or pick a quick example, then hit Debug.</p>
+    </div>
+  );
+  const c = result.confidence;
+  const level = c >= 75 ? "High" : c >= 45 ? "Medium" : "Low";
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-lg font-semibold">{result.title}</h2>
+        <div className="flex gap-2">
+          <span className="rounded-full border px-2.5 py-0.5 font-mono text-xs">{result.status_code ?? "—"} · {result.error_type}</span>
+          <span className={cn("rounded-full px-2.5 py-0.5 text-xs font-semibold text-background",
+            level === "High" ? "bg-success" : level === "Medium" ? "bg-warning" : "bg-destructive")}>
+            {level} confidence · {c}%
+          </span>
+        </div>
+      </div>
+      <Card icon={AlertTriangle} title="Root Cause"><p className="text-sm">{result.root_cause}</p></Card>
+      <Card icon={BookOpen} title="Why it happened (beginner-friendly)"><p className="text-sm text-muted-foreground">{result.explanation}</p></Card>
+      <Card icon={Code2} title="Fixed Code"><CodeBlock code={result.fixed_code} language={language} /></Card>
+      <Card icon={Lightbulb} title="Prevention Tips">
+        <ul className="space-y-1.5">{result.prevention_tips.map((t, i) => <li key={i} className="flex gap-2 text-sm"><ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-success" />{t}</li>)}</ul>
+      </Card>
+    </div>
+  );
+}
+debug.tsx:
+import { createFileRoute } from "@tanstack/react-router";
+import { useRef, useState } from "react";
+import { InputPanel } from "@/components/InputPanel";
+import { ExamplesBar } from "@/components/ExamplesBar";
+import { AgentTrace } from "@/components/AgentTrace";
+import { ResultCards } from "@/components/ResultCards";
+import { runDebug, extractCompletedSteps, DebugError } from "@/lib/debugClient";
+import type { DebugInput, DebugResult, Language, TraceStep } from "@/types/debug";
+
+export const Route = createFileRoute("/debug")({
+  head: () => ({
+    meta: [
+      { title: "Debug Workspace — DevPilot" },
+      { name: "description", content: "Paste a failing API request and error; DevPilot's AI agent finds the root cause and writes the fix." },
+      { property: "og:title", content: "Debug Workspace — DevPilot" },
+      { property: "og:description", content: "AI agent that debugs API integration problems live." },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
+    ],
+  }),
+  component: DebugPage,
+});
+
+function DebugPage() {
+  const [input, setInput] = useState<DebugInput>({ request: "", error: "", docs: "", language: "python" });
+  const [steps, setSteps] = useState<TraceStep[]>([]);
+  const [result, setResult] = useState<DebugResult | null>(null);
+  const [resultLang, setResultLang] = useState<Language>("python");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const abort = useRef<AbortController | null>(null);
+
+  const run = async () => {
+    abort.current?.abort();
+    const ac = new AbortController();
+    abort.current = ac;
+    setLoading(true); setError(null); setResult(null); setSteps([]);
+    const lang = input.language;
+    try {
+      const r = await runDebug(input, (t) => {
+        const s = extractCompletedSteps(t);
+        setSteps((prev) => (s.length !== prev.length ? s : prev));
+      }, ac.signal);
+      setSteps(r.steps.length >= 5 ? r.steps : (prev) => prev);
+      setResu
