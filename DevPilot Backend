@@ -41,3 +41,104 @@ export const TRACE_LABELS = [
 ] as const;
 
 export const MAX_FIELD_CHARS = 20000;
+Debug.Client.ts:
+import type { DebugInput, DebugResult, TraceStep } from "@/types/debug";
+
+export class DebugError extends Error {
+  constructor(message: string, public status?: number) {
+    super(message);
+  }
+}
+
+/** Extract complete step objects from a partial JSON text stream. */
+export function extractCompletedSteps(text: string): TraceStep[] {
+  const idx = text.indexOf('"steps"');
+  if (idx === -1) return [];
+  const start = text.indexOf("[", idx);
+  if (start === -1) return [];
+  const steps: TraceStep[] = [];
+  let depth = 0, inStr = false, esc = false, objStart = -1;
+  for (let i = start + 1; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") { if (depth === 0) objStart = i; depth++; }
+    else if (c === "}") {
+      depth--;
+      if (depth === 0 && objStart >= 0) {
+        try { steps.push(JSON.parse(text.slice(objStart, i + 1))); } catch { /* skip */ }
+        objStart = -1;
+      }
+    } else if (c === "]" && depth === 0) break;
+  }
+  return steps;
+}
+
+/** Parse final JSON, tolerating code fences and surrounding text. */
+export function parseResult(text: string): DebugResult {
+  let t = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a === -1 || b === -1) throw new DebugError("The agent didn't return a readable result.");
+  t = t.slice(a, b + 1);
+  let r: DebugResult;
+  try { r = JSON.parse(t); } catch { throw new DebugError("The agent's answer couldn't be parsed."); }
+  return {
+    status_code: typeof r.status_code === "number" ? r.status_code : null,
+    error_type: r.error_type ?? "OTHER",
+    title: r.title ?? "Diagnosis",
+    steps: Array.isArray(r.steps) ? r.steps : [],
+    root_cause: r.root_cause ?? "",
+    explanation: r.explanation ?? "",
+    fixed_code: r.fixed_code ?? "",
+    prevention_tips: Array.isArray(r.prevention_tips) ? r.prevention_tips : [],
+    confidence: Math.max(0, Math.min(100, Math.round(Number(r.confidence) || 0))),
+  };
+}
+
+export async function runDebug(
+  input: DebugInput,
+  onText: (full: string) => void,
+  signal?: AbortSignal,
+): Promise<DebugResult> {
+  const res = await fetch("/api/debug-api", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    let msg = "Something went wrong. Please try again.";
+    try { const j = await res.json(); if (j.error) msg = j.error; } catch { /* ignore */ }
+    throw new DebugError(msg, res.status);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "", full = "", done = false;
+  while (!done) {
+    const { value, done: d } = await reader.read();
+    if (d) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      let line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") { done = true; break; }
+      try {
+        const j = JSON.parse(data);
+        if (j.error) throw new DebugError(j.error.message ?? "The AI stream failed.");
+        const delta = j.choices?.[0]?.delta?.content;
+        if (delta) { full += delta; onText(full); }
+      } catch (e) {
+        if (e instanceof DebugError) throw e;
+        buf = line + "\n" + buf; // partial JSON: wait for more
+        break;
+      }
+    }
